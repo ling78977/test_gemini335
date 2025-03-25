@@ -3,252 +3,337 @@
 #include "libobsensor/hpp/Error.hpp"
 #include "libobsensor/hpp/StreamProfile.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "sensor_msgs/msg/imu.hpp"
 #include <memory>
 #include <rclcpp/logging.hpp>
-#include "sensor_msgs/msg/imu.hpp"
-namespace gemini_335_driver
-{
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/point_cloud2_iterator.hpp>
+namespace gemini_335_driver {
 
-  typedef enum
-  {
-    DEPTH_640_480_15 = 0,
-    DEPTH_640_480_30,
+typedef enum {
+  DEPTH_640_480_15 = 0,
+  DEPTH_640_480_30,
 
-  } DepthResolutionFPS;
+} DepthResolutionFPS;
 
-  typedef enum
-  {
-    COLOR_640_480_15 = 0,
-    COLOR_640_480_30,
-    COLOR_1280_720_15,
-    COLOR_1280_720_30,
+typedef enum {
+  COLOR_640_480_15 = 0,
+  COLOR_640_480_30,
+  COLOR_1280_720_15,
+  COLOR_1280_720_30,
 
-  } ColorResolutionFPS;
+} ColorResolutionFPS;
 
-  typedef struct Param
-  {
-    int width = 640;
-    int height = 480;
-    int fps = 15;
-  } Param;
+typedef struct Param {
+  int width = 640;
+  int height = 480;
+  int fps = 15;
+} Param;
 
-  class MinimalNode : public rclcpp::Node
-  {
-  public:
-    MinimalNode(const rclcpp::NodeOptions &options)
-        : rclcpp::Node("gemini335_driver_node", options)
-    {
-      RCLCPP_INFO(this->get_logger(), "Start Gemini335!");
-      // 创建一个Pipeline对象，用于管理depth流
-      std::shared_ptr<ob::Pipeline> stream_pipe = nullptr;
-      try
-      {
-        stream_pipe = std::make_shared<ob::Pipeline>();
+class MinimalNode : public rclcpp::Node {
+public:
+  MinimalNode(const rclcpp::NodeOptions &options)
+      : rclcpp::Node("gemini335_driver_node", options) {
+    RCLCPP_INFO(this->get_logger(), "Start Gemini335!");
+    // 创建一个Pipeline对象，用于管理depth流
+    std::shared_ptr<ob::Pipeline> stream_pipe = nullptr;
+    imu_pub_ = this->create_publisher<sensor_msgs::msg::Imu>("imu/data", 10);
+    try {
+      stream_pipe = std::make_shared<ob::Pipeline>();
+    } catch (ob::Error &e) {
+      RCLCPP_ERROR(this->get_logger(), "Error: %s", e.getMessage());
+      return;
+    }
+    if (!getParams()) {
+      RCLCPP_ERROR(this->get_logger(), "getParams failed !");
+      return;
+    }
+
+    auto device = stream_pipe->getDevice();
+    camera_params_ = stream_pipe->getCameraParam();
+    depth_point_cloud_filter_.setCameraParam(camera_params_);
+    if (is_hardwire_d2d_) {
+      if (device->isPropertySupported(OB_PROP_DISPARITY_TO_DEPTH_BOOL,
+                                      OB_PERMISSION_WRITE)) {
+        // 参数：true 打开硬件 D2D，false 关闭硬件 D2D
+        device->setBoolProperty(OB_PROP_DISPARITY_TO_DEPTH_BOOL, true);
+        RCLCPP_INFO(this->get_logger(), "Open hardware D2D sucessed !");
+      } else {
+        RCLCPP_WARN(this->get_logger(), "device not support hardware D2D");
       }
-      catch (ob::Error &e)
-      {
-        RCLCPP_ERROR(this->get_logger(), "Error: %s", e.getMessage());
+    }
+    if (device->isGlobalTimestampSupported()) {
+      RCLCPP_INFO(this->get_logger(),
+                  "This Device Is Supported GlobalTimestamp.");
+    } else {
+      RCLCPP_WARN(this->get_logger(),
+                  "This Device Is Supported GlobalTimestamp!");
+    }
+
+    auto depth_profiles = stream_pipe->getStreamProfileList(OB_SENSOR_DEPTH);
+
+    std::shared_ptr<ob::VideoStreamProfile> depthProfile = nullptr;
+    depthProfile = depth_profiles->getVideoStreamProfile(
+        depth_params_.width, depth_params_.height, OB_FORMAT_Y16,
+        depth_params_.fps);
+
+    if (depthProfile == nullptr) {
+      RCLCPP_ERROR(this->get_logger(), "depthProfile is nullptr");
+      return;
+    }
+    std::shared_ptr<ob::Config> stream_config = std::make_shared<ob::Config>();
+
+    stream_config->enableStream(depthProfile);
+
+    if (is_use_color_frame_) {
+      auto color_profiles = stream_pipe->getStreamProfileList(OB_SENSOR_COLOR);
+      std::shared_ptr<ob::VideoStreamProfile> colorProfile = nullptr;
+      colorProfile = color_profiles->getVideoStreamProfile(
+          color_params_.width, color_params_.height, OB_FORMAT_MJPEG,
+          color_params_.fps);
+      if (colorProfile == nullptr) {
+        RCLCPP_ERROR(this->get_logger(), "colorProfile is nullptr");
         return;
       }
-      if (!getParams())
-      {
-        RCLCPP_ERROR(this->get_logger(), "getParams failed !");
-        return;
-      }
+      stream_config->enableStream(colorProfile);
+    }
 
-      auto device = stream_pipe->getDevice();
+    auto imu_pipe = std::make_shared<ob::Pipeline>(device);
+    auto gyro_profiles = imu_pipe->getStreamProfileList(OB_SENSOR_GYRO);
+    auto accel_profiles = imu_pipe->getStreamProfileList(OB_SENSOR_ACCEL);
 
-      if (is_hardwire_d2d_)
-      {
-        if (device->isPropertySupported(OB_PROP_DISPARITY_TO_DEPTH_BOOL,
-                                        OB_PERMISSION_WRITE))
-        {
-          // 参数：true 打开硬件 D2D，false 关闭硬件 D2D
-          device->setBoolProperty(OB_PROP_DISPARITY_TO_DEPTH_BOOL, true);
-          RCLCPP_INFO(this->get_logger(), "Open hardware D2D sucessed !");
+    std::shared_ptr<ob::GyroStreamProfile> gyro_profile = nullptr;
+    std::shared_ptr<ob::AccelStreamProfile> accel_profile = nullptr;
+
+    gyro_profile = gyro_profiles->getGyroStreamProfile(OB_GYRO_FS_1000dps,
+                                                       OB_SAMPLE_RATE_100_HZ);
+    accel_profile = accel_profiles->getAccelStreamProfile(
+        OB_ACCEL_FS_4g, OB_SAMPLE_RATE_100_HZ);
+    if (accel_profile == nullptr || gyro_profile == nullptr) {
+      RCLCPP_ERROR(this->get_logger(),
+                   "accel_profile or gyro_profile is nullptr");
+      return;
+    }
+    gyro_intrinsics_ = gyro_profile->getIntrinsic();
+    accel_intrinsics_ = accel_profile->getIntrinsic();
+    std::shared_ptr<ob::Config> imu_config = std::make_shared<ob::Config>();
+    imu_config->enableStream(gyro_profile);
+    imu_config->enableStream(accel_profile);
+    imu_pipe->start(imu_config, [&](std::shared_ptr<ob::FrameSet> frameset) {
+      auto count = frameset->frameCount();
+      // std::cout << "ros2time: " << this->get_clock()->now().nanoseconds() <<
+      // std::endl;
+      auto imu_msg = sensor_msgs::msg::Imu();
+      imu_msg.orientation.x = 0.0;
+      imu_msg.orientation.y = 0.0;
+      imu_msg.orientation.z = 0.0;
+      imu_msg.orientation.w = 1.0;
+      imu_msg.orientation_covariance = {-1.0, 0.0, 0.0, 0.0, 0.0,
+                                        0.0,  0.0, 0.0, 0.0};
+      imu_msg.linear_acceleration_covariance = {liner_accel_cov_, 0.0, 0.0, 0.0,
+                                                liner_accel_cov_, 0.0, 0.0, 0.0,
+                                                liner_accel_cov_};
+      imu_msg.angular_velocity_covariance = {angular_vel_cov_, 0.0, 0.0, 0.0,
+                                             angular_vel_cov_, 0.0, 0.0, 0.0,
+                                             angular_vel_cov_};
+      imu_msg.header.stamp =
+          this->fromUsToROSTime(frameset->globalTimeStampUs());
+      imu_msg.header.frame_id = "imu_link";
+      for (int i = 0; i < count; i++) {
+        std::shared_ptr<ob::Frame> frame = frameset->getFrame(i);
+        if (frame->type() == OBFrameType::OB_FRAME_ACCEL) {
+          auto accelframe = frame->as<ob::AccelFrame>();
+          imu_msg.linear_acceleration.x =
+              accelframe->value().x - gyro_intrinsics_.bias[0];
+          imu_msg.linear_acceleration.y =
+              accelframe->value().y - gyro_intrinsics_.bias[1];
+          imu_msg.linear_acceleration.z =
+              accelframe->value().z - gyro_intrinsics_.bias[2];
+        } else {
+          auto gyroframe = frame->as<ob::GyroFrame>();
+          imu_msg.angular_velocity.x =
+              gyroframe->value().x - accel_intrinsics_.bias[0];
+          imu_msg.angular_velocity.y =
+              gyroframe->value().y - accel_intrinsics_.bias[1];
+          imu_msg.angular_velocity.z =
+              gyroframe->value().z - accel_intrinsics_.bias[2];
         }
-        else
-        {
-          RCLCPP_WARN(this->get_logger(), "device not support hardware D2D");
+      }
+      imu_pub_->publish(imu_msg);
+    });
+
+    rclcpp::spin(this->get_node_base_interface());
+  }
+
+  ob::FrameCallback
+  streamCallback(const std::shared_ptr<ob::FrameSet> frameset) {
+    auto count = frameset->frameCount();
+    // std::cout << "ros2time: " << this->get_clock()->now().nanoseconds() <<
+    // std::endl;
+    for (int i = 0; i < count; i++) {
+      auto frame = frameset->getFrame(i);
+      if (frame->type() == OBFrameType::OB_FRAME_DEPTH) {
+        auto depth_frame = frame->as<ob::DepthFrame>();
+
+        float depth_scale = depth_frame->getValueScale();
+        depth_point_cloud_filter_.setPositionDataScaled(depth_scale);
+        depth_point_cloud_filter_.setCreatePointFormat(OB_FORMAT_POINT);
+        auto result_frame = depth_point_cloud_filter_.process(depth_frame);
+        if (!result_frame) {
+          RCLCPP_ERROR(this->get_logger(), "Failed to process depth frame");
+          return;
         }
+        auto point_size = result_frame->dataSize() / sizeof(OBPoint);
+        auto *points = static_cast<OBPoint *>(result_frame->data());
+        auto width = depth_frame->width();
+        auto height = depth_frame->height();
+        auto point_cloud_msg =
+            std::make_unique<sensor_msgs::msg::PointCloud2>();
+        sensor_msgs::PointCloud2Modifier modifier(*point_cloud_msg);
+        modifier.setPointCloud2FieldsByString(1, "xyz");
+        modifier.resize(width * height);
+        point_cloud_msg->width = depth_frame->width();
+        point_cloud_msg->height = depth_frame->height();
+        point_cloud_msg->row_step =
+            point_cloud_msg->width * point_cloud_msg->point_step;
+        point_cloud_msg->data.resize(point_cloud_msg->height *
+                                     point_cloud_msg->row_step);
+        sensor_msgs::PointCloud2Iterator<float> iter_x(*point_cloud_msg, "x");
+        sensor_msgs::PointCloud2Iterator<float> iter_y(*point_cloud_msg, "y");
+        sensor_msgs::PointCloud2Iterator<float> iter_z(*point_cloud_msg, "z");
+        const static float MIN_DISTANCE = 20.0;    // 2cm
+        const static float MAX_DISTANCE = 10000.0; // 10m
+        const static float min_depth = MIN_DISTANCE / depth_scale;
+        const static float max_depth = MAX_DISTANCE / depth_scale;
+        size_t valid_count = 0;
+        for (size_t i = 0; i < point_size; i++) {
+          bool valid_point =
+              points[i].z >= min_depth && points[i].z <= max_depth;
+          if (valid_point || ordered_pc_) {
+            *iter_x = static_cast<float>(points[i].x / 1000.0);
+            *iter_y = static_cast<float>(points[i].y / 1000.0);
+            *iter_z = static_cast<float>(points[i].z / 1000.0);
+            ++iter_x, ++iter_y, ++iter_z;
+            valid_count++;
+          }
+        }
+        if (valid_count == 0) {
+          RCLCPP_WARN(this->get_logger(), "No valid point in point cloud");
+          return;
+        }
+        if (!ordered_pc_) {
+          point_cloud_msg->is_dense = true;
+          point_cloud_msg->width = valid_count;
+          point_cloud_msg->height = 1;
+          modifier.resize(valid_count);
+        }
+        //TODO:发布消息
       }
-      if (device->isGlobalTimestampSupported())
-      {
-        RCLCPP_INFO(this->get_logger(), "This Device Is Supported GlobalTimestamp.");
-      }
-      else
-      {
-        RCLCPP_WARN(this->get_logger(), "This Device Is Supported GlobalTimestamp!");
-      }
+    }
+  }
 
-      // auto depth_profiles = stream_pipe->getStreamProfileList(OB_SENSOR_DEPTH);
+  // ob::FrameCallback imuCallback(const std::shared_ptr<ob::FrameSet> frameSet)
+  // {
+  //   //     uint64_t timeStamp = frame->timeStamp();
+  //   // auto gyroFrame = frame->as<ob::GyroFrame>();
+  //   // OBGyroValue value = gyroFrame->value();
+  //   // std::cout << "Gyro Frame: {tsp = " << timeStamp
+  //   // << “，temperature = " << gyroFrame->temperature()
+  //   // << ", data["<< value.x << ", " << value.y << ", " << value.z
+  //   // << "]rad/s" << std::endl;
 
-      // std::shared_ptr<ob::VideoStreamProfile> depthProfile = nullptr;
-      // depthProfile = depth_profiles->getVideoStreamProfile(
-      //     depth_params_.width, depth_params_.height, OB_FORMAT_Y16,
-      //     depth_params_.fps);
+  //   auto count = frameSet->frameCount();
+  //   RCLCPP_INFO(this->get_logger(), "this count: %d", &count);
+  // }
 
-      // if (depthProfile == nullptr)
-      // {
-      //   RCLCPP_ERROR(this->get_logger(), "depthProfile is nullptr");
-      //   return;
-      // }
-      // std::shared_ptr<ob::Config> stream_config = std::make_shared<ob::Config>();
+private:
+  bool is_hardwire_d2d_ = true;
+  bool is_first_depth_frame_ = true;
+  bool is_use_color_frame_ = true;
+  bool ordered_pc_ = false;
 
-      // stream_config->enableStream(depthProfile);
+  Param depth_params_;
+  Param color_params_;
+  OBGyroIntrinsic gyro_intrinsics_;
+  OBAccelIntrinsic accel_intrinsics_;
+  OBCameraParam camera_params_;
+  rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
+  double liner_accel_cov_ = 0.0001;
+  double angular_vel_cov_ = 0.0001;
+  ob::PointCloudFilter depth_point_cloud_filter_;
 
-      // if (is_use_color_frame_)
-      // {
-      //   auto color_profiles = stream_pipe->getStreamProfileList(OB_SENSOR_COLOR);
-      //   std::shared_ptr<ob::VideoStreamProfile> colorProfile = nullptr;
-      //   colorProfile = color_profiles->getVideoStreamProfile(
-      //       color_params_.width, color_params_.height, OB_FORMAT_MJPEG,
-      //       color_params_.fps);
-      //   if (colorProfile == nullptr)
-      //   {
-      //     RCLCPP_ERROR(this->get_logger(), "colorProfile is nullptr");
-      //     return;
-      //   }
-
-      //   stream_config->enableStream(colorProfile);
-      // }
-
-      auto imu_pipe = std::make_shared<ob::Pipeline>(device);
-      auto gyro_profiles = imu_pipe->getStreamProfileList(OB_SENSOR_GYRO);
-      auto accel_profiles = imu_pipe->getStreamProfileList(OB_SENSOR_ACCEL);
-
-      std::shared_ptr<ob::GyroStreamProfile> gyro_profile = nullptr;
-      std::shared_ptr<ob::AccelStreamProfile> accel_profile = nullptr;
-
-      gyro_profile = gyro_profiles->getGyroStreamProfile(OB_GYRO_FS_1000dps,
-                                                         OB_SAMPLE_RATE_100_HZ);
-      accel_profile = accel_profiles->getAccelStreamProfile(
-          OB_ACCEL_FS_4g, OB_SAMPLE_RATE_100_HZ);
-      if (accel_profile == nullptr || gyro_profile == nullptr)
-      {
-        RCLCPP_ERROR(this->get_logger(),
-                     "accel_profile or gyro_profile is nullptr");
-        return;
-      }
-      std::shared_ptr<ob::Config> imu_config = std::make_shared<ob::Config>();
-      imu_config->enableStream(gyro_profile);
-      imu_config->enableStream(accel_profile);
-      imu_pipe->start(imu_config, [&](std::shared_ptr<ob::FrameSet> frameset)
-                      {
-                        auto count = frameset->frameCount();
-                        std::cout << "ros2time: " << this->get_clock()->now().nanoseconds() << std::endl;
-                        for(int i=0;i<count;i++){
-                          auto frame=frameset->getFrame(i);
-                          std::cout<<"    time: "<<frame->globalTimeStampUs()<<"\n";
-                          std::cout<<"type: "<<frame->type()<<"\n";
-                        }
-                      });
-
-      rclcpp::spin(this->get_node_base_interface());
+  bool getParams() {
+    int depth_param;
+    int color_param;
+    try {
+      is_hardwire_d2d_ = declare_parameter<bool>("is_hardwire_d2d", true);
+      is_use_color_frame_ = declare_parameter<bool>("is_use_color_frame", true);
+      depth_param = declare_parameter<int>("depth_param", 0);
+      color_param = declare_parameter<int>("color_param", 2);
+      depth_param = depth_param >= 0 ? depth_param : 0;
+      color_param = color_param >= 0 ? color_param : 0;
+      depth_param = depth_param <= 5 ? depth_param : 5;
+      color_param = color_param <= 3 ? color_param : 3;
+    } catch (const std::exception &e) {
+      RCLCPP_ERROR(this->get_logger(), "Exception: %s", e.what());
+      return false;
+    }
+    switch (depth_param) {
+    case DEPTH_640_480_15:
+      depth_params_.width = 640;
+      depth_params_.height = 480;
+      depth_params_.fps = 15;
+      break;
+    case DEPTH_640_480_30:
+      depth_params_.width = 640;
+      depth_params_.height = 480;
+      depth_params_.fps = 30;
+      break;
+    default:
+      depth_params_.width = 640;
+      depth_params_.height = 480;
+      depth_params_.fps = 15;
+      break;
+    }
+    switch (color_param) {
+    case COLOR_640_480_15:
+      color_params_.width = 640;
+      color_params_.height = 480;
+      color_params_.fps = 15;
+      break;
+    case COLOR_640_480_30:
+      color_params_.width = 640;
+      color_params_.height = 480;
+      color_params_.fps = 30;
+      break;
+    case COLOR_1280_720_15:
+      color_params_.width = 1280;
+      color_params_.height = 720;
+      color_params_.fps = 15;
+      break;
+    case COLOR_1280_720_30:
+      color_params_.width = 1280;
+      color_params_.height = 720;
+      color_params_.fps = 30;
+      break;
+    default:
+      color_params_.width = 640;
+      color_params_.height = 480;
+      color_params_.fps = 15;
+      break;
     }
 
-    ob::FrameCallback streamCallback(const std::shared_ptr<ob::FrameSet> frameset)
-    {  auto count = frameset->frameCount();
-                        std::cout << "ros2time: " << this->get_clock()->now().nanoseconds() << std::endl;
-                        for(int i=0;i<count;i++){
-                          auto frame=frameset->getFrame(i);
-                          std::cout<<"    time: "<<frame->globalTimeStampUs()<<"\n";
-                          std::cout<<"type: "<<frame->type()<<"\n";
-                        }
-    }
+    return true;
+  }
 
-    ob::FrameCallback imuCallback(const std::shared_ptr<ob::FrameSet> frameSet)
-    {
-      //     uint64_t timeStamp = frame->timeStamp();
-      // auto gyroFrame = frame->as<ob::GyroFrame>();
-      // OBGyroValue value = gyroFrame->value();
-      // std::cout << "Gyro Frame: {tsp = " << timeStamp
-      // << “，temperature = " << gyroFrame->temperature()
-      // << ", data["<< value.x << ", " << value.y << ", " << value.z
-      // << "]rad/s" << std::endl;
-
-      auto count = frameSet->frameCount();
-      RCLCPP_INFO(this->get_logger(), "this count: %d", &count);
-    }
-
-  private:
-    bool is_hardwire_d2d_ = true;
-    bool is_first_depth_frame_ = true;
-    bool is_use_color_frame_ = true;
-
-    Param depth_params_;
-    Param color_params_;
-
-    bool getParams()
-    {
-      int depth_param;
-      int color_param;
-      try
-      {
-        is_hardwire_d2d_ = declare_parameter<bool>("is_hardwire_d2d", true);
-        is_use_color_frame_ = declare_parameter<bool>("is_use_color_frame", true);
-        depth_param = declare_parameter<int>("depth_param", 0);
-        color_param = declare_parameter<int>("color_param", 2);
-        depth_param = depth_param >= 0 ? depth_param : 0;
-        color_param = color_param >= 0 ? color_param : 0;
-        depth_param = depth_param <= 5 ? depth_param : 5;
-        color_param = color_param <= 3 ? color_param : 3;
-      }
-      catch (const std::exception &e)
-      {
-        RCLCPP_ERROR(this->get_logger(), "Exception: %s", e.what());
-        return false;
-      }
-      switch (depth_param)
-      {
-      case DEPTH_640_480_15:
-        depth_params_.width = 640;
-        depth_params_.height = 480;
-        depth_params_.fps = 15;
-        break;
-      case DEPTH_640_480_30:
-        depth_params_.width = 640;
-        depth_params_.height = 480;
-        depth_params_.fps = 30;
-        break;
-      default:
-        depth_params_.width = 640;
-        depth_params_.height = 480;
-        depth_params_.fps = 15;
-        break;
-      }
-      switch (color_param)
-      {
-      case COLOR_640_480_15:
-        color_params_.width = 640;
-        color_params_.height = 480;
-        color_params_.fps = 15;
-        break;
-      case COLOR_640_480_30:
-        color_params_.width = 640;
-        color_params_.height = 480;
-        color_params_.fps = 30;
-        break;
-      case COLOR_1280_720_15:
-        color_params_.width = 1280;
-        color_params_.height = 720;
-        color_params_.fps = 15;
-        break;
-      case COLOR_1280_720_30:
-        color_params_.width = 1280;
-        color_params_.height = 720;
-        color_params_.fps = 30;
-        break;
-      default:
-        color_params_.width = 640;
-        color_params_.height = 480;
-        color_params_.fps = 15;
-        break;
-      }
-
-      return true;
-    }
-  };
+  rclcpp::Time fromUsToROSTime(uint64_t us) {
+    auto total = static_cast<uint64_t>(us * 1e3);
+    uint64_t sec = total / 1000000000;
+    uint64_t nano_sec = total % 1000000000;
+    rclcpp::Time stamp(sec, nano_sec);
+    return stamp;
+  }
+};
 } // namespace gemini_335_driver
 
 #include "rclcpp_components/register_node_macro.hpp"
