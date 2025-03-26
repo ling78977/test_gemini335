@@ -9,6 +9,7 @@ endif()
 
 # find dependencies
 find_package(ament_cmake_auto REQUIRED)
+find_package(OpenCV REQUIRED)
 ament_auto_find_build_dependencies()
 
 
@@ -40,8 +41,10 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
   src/gemini_335_driver_node.cpp
 )
 
-target_include_directories(${PROJECT_NAME} PUBLIC ${ORBBEC_INCLUDE_DIR})
-target_link_libraries(${PROJECT_NAME} ${ORBBEC_LIBS})
+target_include_directories(${PROJECT_NAME} PUBLIC ${ORBBEC_INCLUDE_DIR}
+${OpenCV_INCLUDE_DIR}    )
+target_link_libraries(${PROJECT_NAME} ${ORBBEC_LIBS}
+${OpenCV_LIBS})
 
 rclcpp_components_register_node(${PROJECT_NAME}
   PLUGIN gemini_335_driver::MinimalNode
