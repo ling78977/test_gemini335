@@ -4,6 +4,7 @@
 #include "libobsensor/hpp/StreamProfile.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/imu.hpp"
+#include <cv_bridge/cv_bridge.h>
 #include <image_transport/image_transport.hpp>
 #include <memory>
 #include <opencv4/opencv2/opencv.hpp>
@@ -37,7 +38,7 @@ public:
   MinimalNode(const rclcpp::NodeOptions &options)
       : rclcpp::Node("gemini335_driver_node", options) {
     RCLCPP_INFO(this->get_logger(), "Start Gemini335!");
-    // 创建一个Pipeline对象，用于管理depth流
+    image_msg_.data.reserve(640 * 480 * 3);
     std::shared_ptr<ob::Pipeline> stream_pipe = nullptr;
     imu_pub_ = this->create_publisher<sensor_msgs::msg::Imu>(
         "imu/data", rclcpp::QoS(rclcpp::QoSInitialization::from_rmw(
@@ -57,10 +58,7 @@ public:
       RCLCPP_ERROR(this->get_logger(), "getParams failed !");
       return;
     }
-
     auto device = stream_pipe->getDevice();
-    camera_params_ = stream_pipe->getCameraParam();
-    depth_point_cloud_filter_.setCameraParam(camera_params_);
     if (is_hardwire_d2d_) {
       if (device->isPropertySupported(OB_PROP_DISPARITY_TO_DEPTH_BOOL,
                                       OB_PERMISSION_WRITE)) {
@@ -78,22 +76,17 @@ public:
       RCLCPP_WARN(this->get_logger(),
                   "This Device Is Supported GlobalTimestamp!");
     }
-
     auto depth_profiles = stream_pipe->getStreamProfileList(OB_SENSOR_DEPTH);
-
     std::shared_ptr<ob::VideoStreamProfile> depthProfile = nullptr;
     depthProfile = depth_profiles->getVideoStreamProfile(
         depth_params_.width, depth_params_.height, OB_FORMAT_Y16,
         depth_params_.fps);
-
     if (depthProfile == nullptr) {
       RCLCPP_ERROR(this->get_logger(), "depthProfile is nullptr");
       return;
     }
     std::shared_ptr<ob::Config> stream_config = std::make_shared<ob::Config>();
-
     stream_config->enableStream(depthProfile);
-
     if (is_use_color_frame_) {
       this->image_publisher_ = std::make_shared<image_transport::Publisher>(
           image_transport::create_publisher(this, "/image_raw",
@@ -102,7 +95,7 @@ public:
       auto color_profiles = stream_pipe->getStreamProfileList(OB_SENSOR_COLOR);
       std::shared_ptr<ob::VideoStreamProfile> colorProfile = nullptr;
       colorProfile = color_profiles->getVideoStreamProfile(
-          color_params_.width, color_params_.height, OB_FORMAT_MJPEG,
+          color_params_.width, color_params_.height, OB_FORMAT_RGB,
           color_params_.fps);
       if (colorProfile == nullptr) {
         RCLCPP_ERROR(this->get_logger(), "colorProfile is nullptr");
@@ -110,7 +103,6 @@ public:
       }
       stream_config->enableStream(colorProfile);
     }
-
     auto imu_pipe = std::make_shared<ob::Pipeline>(device);
     auto gyro_profiles = imu_pipe->getStreamProfileList(OB_SENSOR_GYRO);
     auto accel_profiles = imu_pipe->getStreamProfileList(OB_SENSOR_ACCEL);
@@ -180,35 +172,26 @@ public:
     stream_pipe->start(stream_config, [&](std::shared_ptr<ob::FrameSet>
                                               frameset) {
       auto count = frameset->frameCount();
-
       for (int i = 0; i < count; i++) {
-
         auto frame = frameset->getFrame(i);
         auto timestamp = fromUsToROSTime(frame->globalTimeStampUs());
-        RCLCPP_INFO_STREAM(this->get_logger(),
-                           "time: " << timestamp.nanoseconds());
         if (frame->type() == OBFrameType::OB_FRAME_DEPTH) {
           auto depth_frame = frame->as<ob::DepthFrame>();
           float depth_scale = depth_frame->getValueScale();
-          
-          // RCLCPP_INFO_STREAM(this->get_logger(), "format: " << depth_frame->format());
-          // uint16_t*p= (uint16_t*)depth_frame->data();
-          // for(int i=0;i<depth_frame->dataSize();i++){
-          //   std::cout<<*p<<" ";
-          //   p++;
-          // }
-
           depth_point_cloud_filter_.setPositionDataScaled(depth_scale);
           depth_point_cloud_filter_.setCreatePointFormat(OB_FORMAT_POINT);
-          //TODO:深度图有数据，转换为点云没有数据了
+          if (!is_set_filter_camera_param_) {
+            depth_point_cloud_filter_.setCameraParam(
+                stream_pipe->getCameraParam());
+            is_set_filter_camera_param_ = true;
+            continue;
+          }
           auto result_frame = depth_point_cloud_filter_.process(depth_frame);
-          // savePointsToPly(frame, "_DepthPoints.ply");
           if (!result_frame) {
             RCLCPP_ERROR(this->get_logger(), "Failed to process depth frame");
             return;
           }
           auto point_size = result_frame->dataSize() / sizeof(OBPoint);
-
           auto *points = static_cast<OBPoint *>(result_frame->data());
           auto width = depth_frame->width();
           auto height = depth_frame->height();
@@ -230,12 +213,8 @@ public:
           const static float MAX_DISTANCE = 10000.0; // 10m
           const static float min_depth = MIN_DISTANCE / depth_scale;
           const static float max_depth = MAX_DISTANCE / depth_scale;
-          // RCLCPP_INFO_STREAM(this->get_logger(),
-          //                    "min_depth: " << depth_frame->dataSize()
-          //                                  << " max_depth: " << max_depth);
           size_t valid_count = 0;
           for (size_t i = 0; i < point_size; i++) {
-
             bool valid_point =
                 points[i].z >= min_depth && points[i].z <= max_depth;
             if (valid_point || ordered_pc_) {
@@ -256,24 +235,18 @@ public:
             point_cloud_msg->height = 1;
             modifier.resize(valid_count);
           }
-          // TODO:发布消息
           point_cloud_msg->header.stamp = timestamp;
           point_cloud_msg->header.frame_id = "camera_depth_optical_frame";
           point_cloud_pub_->publish(std::move(point_cloud_msg));
         } else if (frame->type() == OBFrameType::OB_FRAME_COLOR) {
-          auto color_frame = frame->as<ob::ColorFrame>();
-          // cv::Mat image;
+          auto color_frame = frame->as<ob::VideoFrame>();
+          cv::Mat rawMat(color_frame->height(), color_frame->width(), CV_8UC3,
+                         color_frame->data());
+          cv_bridge::CvImage(std_msgs::msg::Header(), "rgb8", rawMat)
+              .toImageMsg(image_msg_);
           image_msg_.header.stamp = timestamp;
           image_msg_.header.frame_id = "camera_color_optical_frame";
-          image_msg_.encoding = "rgb8";
-          image_msg_.width = color_frame->width();
-          image_msg_.height = color_frame->height();
-          image_msg_.step = color_frame->width() * 3;
-          memcpy(image_msg_.data.data(), color_frame->data(),
-                 color_frame->dataSize());
-          image_msg_.data.reserve(image_msg_.height * image_msg_.width * 3);
           this->image_publisher_->publish(image_msg_);
-        
         }
       }
     });
@@ -281,32 +254,12 @@ public:
     rclcpp::spin(this->get_node_base_interface());
   }
 
-void savePointsToPly(std::shared_ptr<ob::Frame> frame, std::string fileName) {
-    int   pointsSize = frame->dataSize() / sizeof(OBPoint);
-    FILE *fp         = fopen(fileName.c_str(), "wb+");
-    fprintf(fp, "ply\n");
-    fprintf(fp, "format ascii 1.0\n");
-    fprintf(fp, "element vertex %d\n", pointsSize);
-    fprintf(fp, "property float x\n");
-    fprintf(fp, "property float y\n");
-    fprintf(fp, "property float z\n");
-    fprintf(fp, "end_header\n");
-
-    OBPoint *point = (OBPoint *)frame->data();
-    for(int i = 0; i < pointsSize; i++) {
-        fprintf(fp, "%.3f %.3f %.3f\n", point->x, point->y, point->z);
-        point++;
-    }
-
-    fflush(fp);
-    fclose(fp);
-}
-
 private:
   bool is_hardwire_d2d_ = true;
   bool is_first_depth_frame_ = true;
   bool is_use_color_frame_ = true;
   bool ordered_pc_ = false;
+  bool is_set_filter_camera_param_ = false;
 
   Param depth_params_;
   Param color_params_;
@@ -328,7 +281,7 @@ private:
       is_hardwire_d2d_ = declare_parameter<bool>("is_hardwire_d2d", true);
       is_use_color_frame_ = declare_parameter<bool>("is_use_color_frame", true);
       depth_param = declare_parameter<int>("depth_param", 0);
-      color_param = declare_parameter<int>("color_param", 2);
+      color_param = declare_parameter<int>("color_param", 0);
       depth_param = depth_param >= 0 ? depth_param : 0;
       color_param = color_param >= 0 ? color_param : 0;
       depth_param = depth_param <= 5 ? depth_param : 5;
