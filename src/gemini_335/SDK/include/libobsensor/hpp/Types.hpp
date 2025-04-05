@@ -4,7 +4,6 @@
  */
 
 #pragma once
-
 #include "libobsensor/h/ObTypes.h"
 
 #include <functional>

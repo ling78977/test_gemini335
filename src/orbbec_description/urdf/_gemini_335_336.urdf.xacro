@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- This URDF was automatically created by SolidWorks to URDF Exporter! Originally created by
+Stephen Brawner (brawner@gmail.com) 
+     Commit Version: 1.6.0-4-g7f85cfe  Build Version: 1.6.7995.38578
+     For more information, please see http://wiki.ros.org/sw_urdf_exporter -->
+<robot xmlns:xacro="http://ros.org/wiki/xacro" name="gemini_335_336">
+    <xacro:property name="mesh_path" value="package://orbbec_description/meshes/gemini335_336/" />
+
+    <link name="camera_link">
+    </link>
+    <link name="camera_infra_1_frame">
+    </link>
+
+    <joint name="camera_infra_1_joint" type="fixed">
+        <origin xyz="0.01587 -0.025 0.0125" rpy="0 0 0" />
+        <parent link="camera_link" />
+        <child link="camera_infra_1_frame" />
+        <axis xyz="0 0 0" />
+    </joint>
+
+    <link name="camera_infra_1_optical_frame">
+    </link>
+
+    <joint name="camera_infra_1_optical_joint" type="fixed">
+        <origin xyz="0.01587 -0.025 0.0125" rpy="-1.5707963267949 0 -1.5707963267949" />
+        <parent link="camera_link" />
+        <child link="camera_infra_1_optical_frame" />
+        <axis xyz="0 0 0" />
+    </joint>
+
+    <link name="camera_infra2_frame">
+    </link>
+
+    <joint name="camera_infra2_joint" type="fixed">
+        <origin xyz="0.01587 0.025 0.0125" rpy="0 0 0" />
+        <parent link="camera_link" />
+        <child link="camera_infra2_frame" />
+        <axis xyz="0 0 0" />
+    </joint>
+
+    <link name="camera_infra2_optical_frame">
+    </link>
+
+    <joint name="camera_infra2_optical_joint" type="fixed">
+        <origin xyz="0.01587 0.025 0.0125" rpy="-1.5707963267949 0 -1.5707963267949" />
+        <parent link="camera_link" />
+        <child link="camera_infra2_optical_frame" />
+        <axis xyz="0 0 0" />
+    </joint>
+
+    <link name="camera_color_frame">
+    </link>
+
+    <joint name="camera_color_joint" type="fixed">
+        <origin xyz="0.017533 0.010995 0.012505" rpy="0 0 0" />
+        <parent link="camera_link" />
+        <child link="camera_color_frame" />
+        <axis xyz="0 0 0" />
+    </joint>
+
+    <link name="camera_color_optical_frame">
+    </link>
+
+    <joint name="camera_color_optical_joint" type="fixed">
+        <origin xyz="0.017533 0.010995 0.012505" rpy="-1.5707963267949 0 -1.5707963267949" />
+        <parent link="camera_link" />
+        <child link="camera_color_optical_frame" />
+        <axis xyz="0 0 0" />
+    </joint>
+
+    <link name="camera_depth_frame">
+    </link>
+
+    <joint name="camera_depth_joint" type="fixed">
+        <origin xyz="0.01587 -0.025 0.0125" rpy="0 0 0" />
+        <parent link="camera_bottom_screw_frame" />
+        <child link="camera_depth_frame" />
+        <axis xyz="0 0 0" />
+    </joint>
+
+    <link name="camera_depth_optical_frame">
+    </link>
+
+    <joint name="camera_depth_optical_joint" type="fixed">
+        <origin xyz="0.01587 -0.025 0.0125" rpy="-1.5707963267949 0 -1.5707963267949" />
+        <parent link="camera_bottom_screw_frame" />
+        <child link="camera_depth_optical_frame" />
+        <axis xyz="0 0 0" />
+    </joint>
+</robot>

@@ -143,7 +143,7 @@ public:
                                              angular_vel_cov_, 0.0, 0.0, 0.0,
                                              angular_vel_cov_};
 
-      imu_msg.header.frame_id = "imu_link";
+      imu_msg.header.frame_id = "imu_frame";
       for (uint i = 0; i < count; i++) {
         std::shared_ptr<ob::Frame> frame = frameset->getFrame(i);
         if (frame->type() == OBFrameType::OB_FRAME_ACCEL) {
@@ -214,17 +214,26 @@ public:
           const static float min_depth = MIN_DISTANCE / depth_scale;
           const static float max_depth = MAX_DISTANCE / depth_scale;
           size_t valid_count = 0;
-          for (size_t i = 0; i < point_size; i++) {
+          for (size_t i = 0; i < point_size; i+=130) {
             bool valid_point =
                 points[i].z >= min_depth && points[i].z <= max_depth;
             if (valid_point || ordered_pc_) {
-              *iter_x = static_cast<float>(points[i].x / 1000.0);
-              *iter_y = static_cast<float>(points[i].y / 1000.0);
-              *iter_z = static_cast<float>(points[i].z / 1000.0);
+              *iter_x = static_cast<float>(points[i].z / 1000.0);
+              *iter_y = static_cast<float>(-points[i].x / 1000.0);
+              *iter_z = static_cast<float>(-points[i].y / 1000.0);
+              
+              // iter_x+=500,iter_y+=500,iter_y+=500;
+              // RCLCPP_INFO_STREAM(this->get_logger(),"x: "<<*iter_x<<" y: "<<*iter_y<<" z: "<<*iter_z);
               ++iter_x, ++iter_y, ++iter_z;
               valid_count++;
             }
           }
+          if(++polling_start>500){
+            polling_start=0;
+            // savePointsToPly(result_frame,std::to_string(this->get_clock()->now().nanoseconds())+".ply");
+            // RCLCPP_INFO_STREAM(this->get_logger(),"paocun");
+          }
+          
           if (valid_count == 0) {
             RCLCPP_WARN(this->get_logger(), "No valid point in point cloud");
             return;
@@ -236,7 +245,8 @@ public:
             modifier.resize(valid_count);
           }
           point_cloud_msg->header.stamp = timestamp;
-          point_cloud_msg->header.frame_id = "camera_depth_optical_frame";
+          point_cloud_msg->header.frame_id = "laser_frame";
+          // RCLCPP_INFO_STREAM(this->get_logger(),point_cloud_msg->data.size());
           point_cloud_pub_->publish(std::move(point_cloud_msg));
         } else if (frame->type() == OBFrameType::OB_FRAME_COLOR) {
           auto color_frame = frame->as<ob::VideoFrame>();
@@ -253,6 +263,26 @@ public:
 
     rclcpp::spin(this->get_node_base_interface());
   }
+  void savePointsToPly(std::shared_ptr<ob::Frame> frame, std::string fileName) {
+    int   pointsSize = frame->dataSize() / sizeof(OBPoint);
+    FILE *fp         = fopen(fileName.c_str(), "wb+");
+    fprintf(fp, "ply\n");
+    fprintf(fp, "format ascii 1.0\n");
+    fprintf(fp, "element vertex %d\n", pointsSize);
+    fprintf(fp, "property float x\n");
+    fprintf(fp, "property float y\n");
+    fprintf(fp, "property float z\n");
+    fprintf(fp, "end_header\n");
+
+    OBPoint *point = (OBPoint *)frame->data();
+    for(int i = 0; i < pointsSize; i+=500) {
+        fprintf(fp, "%.3f %.3f %.3f\n", point->x, point->y, point->z);
+        point++;
+    }
+
+    fflush(fp);
+    fclose(fp);
+}
 
 private:
   bool is_hardwire_d2d_ = true;
@@ -260,6 +290,7 @@ private:
   bool is_use_color_frame_ = true;
   bool ordered_pc_ = false;
   bool is_set_filter_camera_param_ = false;
+  uint16_t polling_start=0;
 
   Param depth_params_;
   Param color_params_;
